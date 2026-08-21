@@ -242,27 +242,22 @@ def bot_invite(data: InviteIn, _=Depends(check_bot_secret)):
 
 
 # ---------------------------------------------------------------- Jobsuche
+# Mehrere Quellen parallel. Jede Quelle darf einzeln scheitern,
+# ohne dass die ganze Suche kaputt ist.
 
-@app.get("/api/jobs")
-def search_jobs(q: str, ort: str = "", user: dict = Depends(current_user)):
-    """Sucht Jobs auf karriere.at und gibt Titel/Firma/Ort/Link zurueck."""
+from concurrent.futures import ThreadPoolExecutor
+
+UA = {"User-Agent": "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
+
+
+def _quelle_karriere(q: str, ort: str) -> list:
     url = f"https://www.karriere.at/jobs/{quote_plus(q)}"
     if ort:
         url += f"/{quote_plus(ort)}"
-    try:
-        r = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36"},
-            timeout=12,
-        )
-        r.raise_for_status()
-    except Exception:
-        raise HTTPException(502, "karriere.at nicht erreichbar - spaeter nochmal probieren")
-
+    r = requests.get(url, headers=UA, timeout=10)
+    r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     jobs = []
-    seen = set()
-
     for item in soup.select("[class*='jobsListItem'], [class*='jobs-item'], article"):
         a = item.select_one("a[href*='/jobs/']") or item.select_one("h2 a, h3 a")
         if not a:
@@ -271,10 +266,8 @@ def search_jobs(q: str, ort: str = "", user: dict = Depends(current_user)):
         link = a.get("href", "")
         if link.startswith("/"):
             link = "https://www.karriere.at" + link
-        if not titel or link in seen:
+        if not titel:
             continue
-        seen.add(link)
-
         firma_el = item.select_one("[class*='company']")
         ort_el = item.select_one("[class*='location']")
         jobs.append({
@@ -282,11 +275,130 @@ def search_jobs(q: str, ort: str = "", user: dict = Depends(current_user)):
             "firma": firma_el.get_text(strip=True) if firma_el else "",
             "ort": ort_el.get_text(" ", strip=True) if ort_el else "",
             "link": link,
+            "quelle": "karriere.at",
         })
-        if len(jobs) >= 20:
-            break
-
     return jobs
+
+
+def _quelle_ams(q: str, ort: str) -> list:
+    """AMS alle-jobs Suche (offizielle AMS-Jobplattform)."""
+    r = requests.get(
+        "https://www.ams.at/allejobs/suche",
+        params={"searchterm": q, "location": ort or ""},
+        headers=UA, timeout=10,
+    )
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    jobs = []
+    for item in soup.select("[class*='job'], article, li"):
+        a = item.select_one("a[href*='job']")
+        if not a:
+            continue
+        titel = a.get_text(strip=True)
+        link = a.get("href", "")
+        if link.startswith("/"):
+            link = "https://www.ams.at" + link
+        if not titel or len(titel) < 4 or not link:
+            continue
+        jobs.append({
+            "titel": titel, "firma": "", "ort": ort or "",
+            "link": link, "quelle": "AMS",
+        })
+    return jobs
+
+
+def _quelle_hokify(q: str, ort: str) -> list:
+    r = requests.get(
+        "https://hokify.at/jobs",
+        params={"searchTerm": q, "location": ort or ""},
+        headers=UA, timeout=10,
+    )
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    jobs = []
+    for a in soup.select("a[href*='/job/'], a[href*='/jobs/']"):
+        titel = a.get_text(" ", strip=True)
+        link = a.get("href", "")
+        if link.startswith("/"):
+            link = "https://hokify.at" + link
+        if not titel or len(titel) < 4:
+            continue
+        jobs.append({
+            "titel": titel[:120], "firma": "", "ort": "",
+            "link": link, "quelle": "hokify",
+        })
+    return jobs
+
+
+def _quelle_jobsat(q: str, ort: str) -> list:
+    url = f"https://www.jobs.at/j/{quote_plus(q)}"
+    if ort:
+        url += f"/{quote_plus(ort)}"
+    r = requests.get(url, headers=UA, timeout=10)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    jobs = []
+    for item in soup.select("[class*='job-item'], [class*='jobitem'], article"):
+        a = item.select_one("a[href*='/job/'], h2 a, h3 a")
+        if not a:
+            continue
+        titel = a.get_text(strip=True)
+        link = a.get("href", "")
+        if link.startswith("/"):
+            link = "https://www.jobs.at" + link
+        if not titel:
+            continue
+        firma_el = item.select_one("[class*='company']")
+        ort_el = item.select_one("[class*='location']")
+        jobs.append({
+            "titel": titel,
+            "firma": firma_el.get_text(strip=True) if firma_el else "",
+            "ort": ort_el.get_text(" ", strip=True) if ort_el else "",
+            "link": link,
+            "quelle": "jobs.at",
+        })
+    return jobs
+
+
+QUELLEN = {
+    "karriere.at": _quelle_karriere,
+    "AMS": _quelle_ams,
+    "hokify": _quelle_hokify,
+    "jobs.at": _quelle_jobsat,
+}
+
+
+@app.get("/api/jobs")
+def search_jobs(q: str, ort: str = "", user: dict = Depends(current_user)):
+    """Fragt alle Quellen parallel ab. Gibt Jobs + Status je Quelle zurueck."""
+    results = {}
+
+    def run(name, fn):
+        try:
+            return name, fn(q, ort)[:40]
+        except Exception:
+            return name, None  # Quelle kaputt/nicht erreichbar
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for name, jobs in ex.map(lambda kv: run(*kv), QUELLEN.items()):
+            results[name] = jobs
+
+    alle = []
+    seen = set()
+    quellen_status = {}
+    for name, jobs in results.items():
+        if jobs is None:
+            quellen_status[name] = "fehler"
+            continue
+        quellen_status[name] = str(len(jobs))
+        for j in jobs:
+            key = j["link"] or (j["titel"] + j["firma"])
+            if key in seen:
+                continue
+            seen.add(key)
+            alle.append(j)
+
+    return {"jobs": alle[:120], "quellen": quellen_status}
 
 
 # ---------------------------------------------------------------- Frontend
