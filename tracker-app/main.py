@@ -25,6 +25,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 API_SECRET = os.environ.get("API_SECRET", "")
 DB_PATH = os.environ.get("DB_PATH", "tracker_db.json")
 
+os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 db = TinyDB(DB_PATH)
 apps_table = db.table("applications")
 whitelist_table = db.table("whitelist")
@@ -139,72 +140,4 @@ def create_application(data: ApplicationIn, user: dict = Depends(current_user)):
 
 @app.patch("/api/applications/{app_id}/status")
 def update_status(app_id: int, data: StatusUpdate, user: dict = Depends(current_user)):
-    if data.status not in STATUSES:
-        raise HTTPException(400, f"Status muss einer sein von: {STATUSES}")
-    row = apps_table.get(doc_id=app_id)
-    if not row or row.get("owner_id") != int(user["id"]):
-        raise HTTPException(404, "Nicht gefunden")
-    apps_table.update({"status": data.status}, doc_ids=[app_id])
-    return {"ok": True}
-
-
-@app.put("/api/applications/{app_id}")
-def update_application(app_id: int, data: ApplicationIn, user: dict = Depends(current_user)):
-    row = apps_table.get(doc_id=app_id)
-    if not row or row.get("owner_id") != int(user["id"]):
-        raise HTTPException(404, "Nicht gefunden")
-    apps_table.update(data.model_dump(), doc_ids=[app_id])
-    return {"ok": True}
-
-
-@app.delete("/api/applications/{app_id}")
-def delete_application(app_id: int, user: dict = Depends(current_user)):
-    row = apps_table.get(doc_id=app_id)
-    if not row or row.get("owner_id") != int(user["id"]):
-        raise HTTPException(404, "Nicht gefunden")
-    apps_table.remove(doc_ids=[app_id])
-    return {"ok": True}
-
-
-# --------------------------------------- Bot-Endpunkte (mit API_SECRET)
-
-class BotApplicationIn(ApplicationIn):
-    owner_id: int
-
-
-def check_bot_secret(x_api_secret: str = Header(default="")):
-    if not API_SECRET or not hmac.compare_digest(x_api_secret, API_SECRET):
-        raise HTTPException(401, "Falscher API-Secret")
-
-
-@app.post("/api/bot/applications")
-def bot_create_application(data: BotApplicationIn, _=Depends(check_bot_secret)):
-    """Dein Cheeworker-Bot legt hiermit automatisch Karten an."""
-    doc = data.model_dump()
-    if not doc["datum"]:
-        doc["datum"] = time.strftime("%Y-%m-%d")
-    doc_id = apps_table.insert(doc)
-    return {"id": doc_id}
-
-
-class InviteIn(BaseModel):
-    user_id: int
-
-
-@app.post("/api/bot/invite")
-def bot_invite(data: InviteIn, _=Depends(check_bot_secret)):
-    """Bot fügt neue User zur Whitelist hinzu (/invite Command)."""
-    W = Query()
-    if not whitelist_table.contains(W.user_id == data.user_id):
-        whitelist_table.insert({"user_id": data.user_id})
-    return {"ok": True}
-
-
-# ---------------------------------------------------------------- Frontend
-
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-
-@app.get("/")
-def index():
-    return FileResponse("static/index.html")
+    if
