@@ -285,46 +285,99 @@ def _quelle_karriere(q: str, ort: str) -> list:
 
 
 def _quelle_ams(q: str, ort: str) -> list:
-    """AMS alle-jobs Suche (offizielle AMS-Jobplattform)."""
-    r = requests.get(
-        "https://www.ams.at/allejobs/suche",
-        params={"searchterm": q, "location": ort or ""},
-        headers=UA, timeout=10,
-    )
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    jobs = []
-    for item in soup.select("[class*='job'], article, li"):
-        a = item.select_one("a[href*='job']")
-        if not a:
+    """AMS 'alle jobs' (jobs.ams.at/public/emps) - mehrere API-Varianten probieren."""
+    suchtext = " ".join(x for x in [q, ort] if x).strip() or "lehre"
+
+    def _extract(items):
+        out = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            titel = str(it.get("title") or it.get("titel") or
+                        it.get("occupation") or it.get("beruf") or "")
+            jid = str(it.get("id") or it.get("jobId") or it.get("uuid") or "")
+            link = (f"https://jobs.ams.at/public/emps/jobs/{jid}" if jid
+                    else str(it.get("url") or it.get("link") or ""))
+            if not titel or not link.startswith("http"):
+                continue
+            firma = str(it.get("company") or it.get("companyName") or
+                        it.get("arbeitgeber") or it.get("employer") or "")
+            ortx = str(it.get("location") or it.get("workplace") or
+                       it.get("ort") or it.get("city") or ort or "")
+            out.append({
+                "titel": titel[:150], "firma": firma[:100], "ort": ortx[:80],
+                "link": link, "quelle": "AMS",
+            })
+        return out
+
+    def _find_items(data):
+        """Job-Liste im JSON finden, egal wie sie heisst."""
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for k in ("items", "jobs", "content", "results", "hits", "advertList", "jobAdverts"):
+                v = data.get(k)
+                if isinstance(v, list) and v:
+                    return v
+                if isinstance(v, dict):
+                    inner = _find_items(v)
+                    if inner:
+                        return inner
+        return []
+
+    basis_params = {
+        "query": suchtext,
+        "sortField": "_SCORE",
+        "sortOrder": "desc",
+        "page": 0,
+        "size": 30,
+    }
+    versuche = [
+        # exakt wie die AMS-Webseite selbst sucht (inkl. WKO-Lehrstellen)
+        ("GET", "https://jobs.ams.at/public/emps/api/jobs", basis_params),
+        ("GET", "https://jobs.ams.at/public/emps/api/jobs/search", basis_params),
+        ("POST", "https://jobs.ams.at/public/emps/api/jobs/search", basis_params),
+        ("GET", "https://jobs.ams.at/public/emps/api/search", basis_params),
+        ("POST", "https://jobs.ams.at/public/emps/api/search",
+         {"query": suchtext, "page": 0, "pageSize": 30}),
+    ]
+    for methode, url, params in versuche:
+        try:
+            if methode == "POST":
+                r = requests.post(url, json=params,
+                                  headers={**UA, "Content-Type": "application/json",
+                                           "Accept": "application/json"},
+                                  timeout=10)
+            else:
+                r = requests.get(url, params=params,
+                                 headers={**UA, "Accept": "application/json"},
+                                 timeout=10)
+            if not r.ok:
+                continue
+            jobs = _extract(_find_items(r.json()))
+            if jobs:
+                return jobs
+        except Exception:
             continue
-        titel = a.get_text(strip=True)
-        link = a.get("href", "")
-        if link.startswith("/"):
-            link = "https://www.ams.at" + link
-        if not titel or len(titel) < 4 or not link:
-            continue
-        jobs.append({
-            "titel": titel, "firma": "", "ort": ort or "",
-            "link": link, "quelle": "AMS",
-        })
-    return jobs
+    return []
 
 
 def _quelle_hokify(q: str, ort: str) -> list:
     r = requests.get(
         "https://hokify.at/jobs",
-        params={"searchTerm": q, "location": ort or ""},
+        params={"searchTerm": q or "", "location": ort or ""},
         headers=UA, timeout=10,
     )
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     jobs = []
-    for a in soup.select("a[href*='/job/'], a[href*='/jobs/']"):
-        titel = a.get_text(" ", strip=True)
+    for a in soup.select("a[href*='/job/'], a[href*='/jobs/'], [data-cy*='job'] a, article a"):
         link = a.get("href", "")
+        if "/job" not in link:
+            continue
         if link.startswith("/"):
             link = "https://hokify.at" + link
+        titel = a.get_text(" ", strip=True) or a.get("title", "") or a.get("aria-label", "")
         if not titel or len(titel) < 4:
             continue
         jobs.append({
@@ -365,11 +418,44 @@ def _quelle_jobsat(q: str, ort: str) -> list:
     return jobs
 
 
+def _quelle_lehrberuf(q: str, ort: str) -> list:
+    """lehrberuf.info - spezialisiert auf Lehrstellen in Oesterreich."""
+    r = requests.get(
+        "https://www.lehrberuf.info/suchergebnisse",
+        params={"what": q or "lehre", "where": ort or ""},
+        headers=UA, timeout=10,
+    )
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    jobs = []
+    for item in soup.select("[class*='job'], [class*='result'], article, li"):
+        a = item.select_one("a[href*='lehrstelle'], a[href*='/job'], h2 a, h3 a")
+        if not a:
+            continue
+        titel = a.get_text(" ", strip=True)
+        link = a.get("href", "")
+        if link.startswith("/"):
+            link = "https://www.lehrberuf.info" + link
+        if not titel or len(titel) < 4 or not link.startswith("http"):
+            continue
+        firma_el = item.select_one("[class*='company'], [class*='firma']")
+        ort_el = item.select_one("[class*='location'], [class*='ort']")
+        jobs.append({
+            "titel": titel[:150],
+            "firma": firma_el.get_text(strip=True)[:100] if firma_el else "",
+            "ort": ort_el.get_text(" ", strip=True)[:80] if ort_el else "",
+            "link": link,
+            "quelle": "lehrberuf.info",
+        })
+    return jobs
+
+
 QUELLEN = {
     "karriere.at": _quelle_karriere,
     "AMS": _quelle_ams,
     "hokify": _quelle_hokify,
     "jobs.at": _quelle_jobsat,
+    "lehrberuf.info": _quelle_lehrberuf,
 }
 
 
@@ -388,7 +474,7 @@ def search_jobs(q: str = "", ort: str = "", user: dict = Depends(current_user)):
         except Exception:
             return name, None  # Quelle kaputt/nicht erreichbar
 
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    with ThreadPoolExecutor(max_workers=5) as ex:
         for name, jobs in ex.map(lambda kv: run(*kv), QUELLEN.items()):
             results[name] = jobs
 
@@ -509,16 +595,20 @@ def job_details(link: str, user: dict = Depends(current_user)):
         soup = BeautifulSoup(r.text, "html.parser")
         for tag in soup(["script", "style", "nav", "footer", "header"]):
             tag.decompose()
-        page_text = soup.get_text(" ", strip=True)[:9000]
+        page_text = soup.get_text(" ", strip=True)[:13000]
     except Exception:
         raise HTTPException(502, "Inserat konnte nicht geladen werden")
 
-    prompt = f"""Das ist der Text einer Stellenanzeige. Fasse auf Deutsch kompakt zusammen:
-- Firma: wer sind die, was machen die
-- Aufgaben: was macht man in dem Job
-- Anforderungen: was muss man mitbringen
-- Gehalt: falls angegeben
-- Bewerbung: wie bewirbt man sich
+    prompt = f"""Das ist der Text einer Stellenanzeige. Fasse auf Deutsch zusammen - so viel Info wie moeglich, aber kompakt pro Punkt. Punkte ohne Info im Text einfach weglassen:
+- Firma: wer sind die, was machen die, wie gross
+- Aufgaben: was macht man in dem Job konkret
+- Anforderungen: Ausbildung, Erfahrung, Faehigkeiten, Fuehrerschein
+- Gehalt: Betrag und ob brutto/monatlich, Ueberzahlung
+- Arbeitszeit: Vollzeit/Teilzeit, Stunden, Schichten
+- Beginn: ab wann
+- Vorteile: Benefits, Zulagen, Aufstiegsmoeglichkeiten
+- Kontakt: Ansprechperson, Telefon
+- Bewerbung: wie bewirbt man sich (Mail, Formular, ...)
 Extrahiere ausserdem die Bewerbungs-E-Mail-Adresse, falls eine im Text steht.
 Antworte NUR mit JSON: {{"zusammenfassung":"...(mit \\n zwischen Punkten)","email":"...oder leer"}}
 
@@ -527,7 +617,7 @@ Text der Anzeige:
     try:
         data = _parse_json(_claude(prompt, max_tokens=1500))
         return {
-            "zusammenfassung": str(data.get("zusammenfassung", ""))[:4000],
+            "zusammenfassung": str(data.get("zusammenfassung", ""))[:6000],
             "email": str(data.get("email", ""))[:100],
         }
     except HTTPException:
@@ -552,6 +642,15 @@ def _extract_text(filename: str, data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+class ProfileDataIn(BaseModel):
+    name: str = ""
+    adresse: str = ""
+    telefon: str = ""
+    email: str = ""
+    geburtsdatum: str = ""
+    info: str = ""  # Ausbildung, Faehigkeiten, sonstiges
+
+
 @app.get("/api/profile")
 def get_profile(user: dict = Depends(current_user)):
     P = Query()
@@ -562,7 +661,46 @@ def get_profile(user: dict = Depends(current_user)):
         "dateiname": row.get("dateiname", ""),
         "datum": row.get("datum", ""),
         "analyse": row.get("analyse", ""),
+        "daten": row.get("daten", {}),
     }
+
+
+@app.post("/api/profile")
+def save_profile(data: ProfileDataIn, user: dict = Depends(current_user)):
+    """Persoenliche Daten speichern (werden fuer Bewerbungen verwendet)."""
+    P = Query()
+    uid = int(user["id"])
+    row = profiles_table.get(P.user_id == uid) or {"user_id": uid}
+    row["daten"] = data.model_dump()
+    profiles_table.upsert(row, P.user_id == uid)
+    return {"ok": True}
+
+
+@app.delete("/api/profile/cv")
+def delete_cv(user: dict = Depends(current_user)):
+    """Nur Lebenslauf + Analyse loeschen, Daten bleiben."""
+    P = Query()
+    uid = int(user["id"])
+    row = profiles_table.get(P.user_id == uid)
+    if row:
+        pfad = row.get("cv_pfad", "")
+        if pfad and os.path.exists(pfad):
+            try:
+                os.remove(pfad)
+            except OSError:
+                pass
+        for k in ("cv_text", "analyse", "dateiname", "datum", "cv_pfad"):
+            row.pop(k, None)
+        profiles_table.upsert(row, P.user_id == uid)
+    return {"ok": True}
+
+
+@app.delete("/api/profile")
+def delete_profile(user: dict = Depends(current_user)):
+    """Alles loeschen: Daten + Lebenslauf + Analyse."""
+    P = Query()
+    profiles_table.remove(P.user_id == int(user["id"]))
+    return {"ok": True}
 
 
 @app.post("/api/profile/cv")
@@ -587,15 +725,136 @@ Antworte auf Deutsch, direkt und ehrlich, mit kurzen Absaetzen:
 Lebenslauf:
 {text}"""
     analyse = _claude(prompt, max_tokens=2000)
+    # Originaldatei speichern, damit sie bei Bewerbungen angehaengt werden kann
+    uid = int(user["id"])
+    cv_dir = os.path.dirname(DB_PATH) or "."
+    ext = ".pdf" if file.filename.lower().endswith(".pdf") else ".docx"
+    cv_pfad = os.path.join(cv_dir, f"cv_{uid}{ext}")
+    with open(cv_pfad, "wb") as f:
+        f.write(data)
     P = Query()
-    profiles_table.upsert({
-        "user_id": int(user["id"]),
+    row = profiles_table.get(P.user_id == uid) or {"user_id": uid}
+    row.update({
         "dateiname": file.filename,
         "cv_text": text,
+        "cv_pfad": cv_pfad,
         "analyse": analyse,
         "datum": time.strftime("%Y-%m-%d"),
-    }, P.user_id == int(user["id"]))
+    })
+    profiles_table.upsert(row, P.user_id == uid)
     return {"analyse": analyse, "dateiname": file.filename, "datum": time.strftime("%Y-%m-%d")}
+
+
+
+# ------------------------------------------------ Direkt bewerben
+
+import smtplib
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+GMAIL_USER = os.environ.get("GMAIL_USER", "")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
+
+
+class EntwurfIn(BaseModel):
+    titel: str
+    firma: str = ""
+    link: str = ""
+
+
+class SendenIn(BaseModel):
+    an: str
+    betreff: str
+    text: str
+    titel: str = ""
+    firma: str = ""
+    ort: str = ""
+    link: str = ""
+
+
+@app.post("/api/bewerbung/entwurf")
+def bewerbung_entwurf(data: EntwurfIn, user: dict = Depends(current_user)):
+    """KI schreibt einen Anschreiben-Entwurf aus Profil + Lebenslauf."""
+    P = Query()
+    row = profiles_table.get(P.user_id == int(user["id"])) or {}
+    daten = row.get("daten", {})
+    cv = (row.get("cv_text", "") or "")[:4000]
+
+    prompt = f"""Schreibe eine kurze Bewerbungs-E-Mail auf Deutsch (Oesterreich).
+Stelle: {data.titel}
+Firma: {data.firma or "unbekannt"}
+Bewerber: {daten.get("name", "")} | {daten.get("adresse", "")} | Tel: {daten.get("telefon", "")} | Mail: {daten.get("email", "")}
+Ausbildung/Faehigkeiten: {daten.get("info", "")}
+Lebenslauf-Auszug: {cv or "keiner vorhanden"}
+
+Regeln:
+- Klassisches oesterreichisches Format: Anrede "Sehr geehrte Damen und Herren", 3 kurze Absaetze, "Mit freundlichen Gruessen" + Name
+- Beginne mit Bezug zur Firma, dann zum Bewerber
+- Konkret und ehrlich, nichts erfinden was nicht in den Daten steht
+- Erwaehne am Ende: "Meinen Lebenslauf finden Sie im Anhang." (nur wenn Lebenslauf vorhanden: {"ja" if row.get("cv_pfad") else "nein"})
+- Keine Platzhalter wie [Name] - wenn eine Info fehlt, Satz weglassen
+Antworte NUR mit JSON: {{"betreff":"Bewerbung: ...","text":"..."}}"""
+    try:
+        d = _parse_json(_claude(prompt, max_tokens=1200))
+        return {
+            "betreff": str(d.get("betreff", f"Bewerbung: {data.titel}"))[:150],
+            "text": str(d.get("text", ""))[:5000],
+            "anhang": bool(row.get("cv_pfad")),
+            "absender": GMAIL_USER,
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(502, "Entwurf fehlgeschlagen - nochmal probieren")
+
+
+@app.post("/api/bewerbung/senden")
+def bewerbung_senden(data: SendenIn, user: dict = Depends(current_user)):
+    """Schickt die Bewerbung per Gmail ab und legt die Tracker-Karte an."""
+    if not (GMAIL_USER and GMAIL_APP_PASSWORD):
+        raise HTTPException(503, "GMAIL_USER / GMAIL_APP_PASSWORD fehlen in den Railway-Variablen")
+    if "@" not in data.an:
+        raise HTTPException(400, "Keine gueltige Empfaenger-Adresse")
+    if len(data.text.strip()) < 30:
+        raise HTTPException(400, "Text zu kurz")
+
+    uid = int(user["id"])
+    P = Query()
+    row = profiles_table.get(P.user_id == uid) or {}
+
+    msg = MIMEMultipart()
+    msg["From"] = GMAIL_USER
+    msg["To"] = data.an
+    msg["Subject"] = data.betreff[:150]
+    msg.attach(MIMEText(data.text, "plain", "utf-8"))
+
+    pfad = row.get("cv_pfad", "")
+    if pfad and os.path.exists(pfad):
+        with open(pfad, "rb") as f:
+            teil = MIMEApplication(f.read())
+        name = row.get("dateiname", "Lebenslauf.pdf")
+        teil.add_header("Content-Disposition", "attachment", filename=name)
+        msg.attach(teil)
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as s:
+            s.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+            s.send_message(msg)
+    except Exception:
+        raise HTTPException(502, "Mail-Versand fehlgeschlagen - Gmail-Zugangsdaten checken")
+
+    apps_table.insert({
+        "owner_id": uid,
+        "firma": data.firma or data.titel,
+        "ort": data.ort,
+        "art": "",
+        "status": "beworben",
+        "link": data.link,
+        "notizen": f"Beworben per Mail an {data.an} am {time.strftime('%d.%m.')}\n{data.titel}",
+        "datum": time.strftime("%Y-%m-%d"),
+    })
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------- Frontend
