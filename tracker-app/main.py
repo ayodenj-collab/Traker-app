@@ -18,7 +18,7 @@ from urllib.parse import parse_qsl, quote_plus
 import requests
 from bs4 import BeautifulSoup
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -32,6 +32,7 @@ os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 db = TinyDB(DB_PATH)
 apps_table = db.table("applications")
 whitelist_table = db.table("whitelist")
+profiles_table = db.table("profiles")
 
 app = FastAPI(title="Bewerbungs-Tracker")
 
@@ -251,9 +252,12 @@ UA = {"User-Agent": "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 
 
 
 def _quelle_karriere(q: str, ort: str) -> list:
-    url = f"https://www.karriere.at/jobs/{quote_plus(q)}"
-    if ort:
-        url += f"/{quote_plus(ort)}"
+    if q and ort:
+        url = f"https://www.karriere.at/jobs/{quote_plus(q)}/{quote_plus(ort)}"
+    elif q:
+        url = f"https://www.karriere.at/jobs/{quote_plus(q)}"
+    else:
+        url = f"https://www.karriere.at/jobs/{quote_plus(ort)}"
     r = requests.get(url, headers=UA, timeout=10)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -331,9 +335,10 @@ def _quelle_hokify(q: str, ort: str) -> list:
 
 
 def _quelle_jobsat(q: str, ort: str) -> list:
-    url = f"https://www.jobs.at/j/{quote_plus(q)}"
-    if ort:
-        url += f"/{quote_plus(ort)}"
+    if q and ort:
+        url = f"https://www.jobs.at/j/{quote_plus(q)}/{quote_plus(ort)}"
+    else:
+        url = f"https://www.jobs.at/j/{quote_plus(q or ort)}"
     r = requests.get(url, headers=UA, timeout=10)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -369,8 +374,12 @@ QUELLEN = {
 
 
 @app.get("/api/jobs")
-def search_jobs(q: str, ort: str = "", user: dict = Depends(current_user)):
+def search_jobs(q: str = "", ort: str = "", user: dict = Depends(current_user)):
     """Fragt alle Quellen parallel ab. Gibt Jobs + Status je Quelle zurueck."""
+    q = q.strip()
+    ort = ort.strip()
+    if not q and not ort:
+        raise HTTPException(400, "Beruf oder Ort eingeben")
     results = {}
 
     def run(name, fn):
@@ -399,6 +408,194 @@ def search_jobs(q: str, ort: str = "", user: dict = Depends(current_user)):
             alle.append(j)
 
     return {"jobs": alle[:120], "quellen": quellen_status}
+
+
+
+# ------------------------------------------------ KI: Claude-API-Helfer
+
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+CLAUDE_MODEL = "claude-sonnet-4-6"
+
+
+def _claude(prompt: str, max_tokens: int = 2500, web: bool = False) -> str:
+    if not ANTHROPIC_KEY:
+        raise HTTPException(503, "ANTHROPIC_API_KEY fehlt in den Railway-Variablen")
+    payload = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if web:
+        payload["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": ANTHROPIC_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json=payload,
+        timeout=180 if web else 90,
+    )
+    r.raise_for_status()
+    return "".join(
+        b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text"
+    )
+
+
+def _parse_json(text: str):
+    text = text.strip()
+    if "```" in text:
+        parts = text.split("```")
+        for p in parts:
+            p = p.strip()
+            if p.startswith("json"):
+                p = p[4:].strip()
+            if p.startswith("[") or p.startswith("{"):
+                text = p
+                break
+    start = min([i for i in [text.find("["), text.find("{")] if i >= 0], default=0)
+    return json.loads(text[start:])
+
+
+# ------------------------------------------------ KI-Tiefensuche
+
+@app.get("/api/jobs/deep")
+def deep_jobs(q: str = "", ort: str = "", user: dict = Depends(current_user)):
+    q, ort = q.strip(), ort.strip()
+    if not q and not ort:
+        raise HTTPException(400, "Beruf oder Ort eingeben")
+    prompt = f"""Suche im Web nach aktuellen Stellenanzeigen in Oesterreich.
+Beruf/Stichwort: {q or "alle Berufe"}. Ort/Region: {ort or "Oesterreich"}.
+Durchsuche breit: Zeitungs-Jobportale (derStandard, Kurier, Heute), willhaben,
+Firmen-Karriereseiten, Gemeinde-Seiten, Lehrstellenboersen (WKO, AMS) - nicht nur karriere.at.
+Antworte NUR mit einem JSON-Array (kein anderer Text), maximal 25 Eintraege:
+[{{"titel":"...","firma":"...","ort":"...","link":"https://...","quelle":"seitenname.at"}}]
+Verwende nur echte Links aus den Suchergebnissen. Keine erfundenen Links."""
+    try:
+        text = _claude(prompt, max_tokens=4000, web=True)
+        jobs = _parse_json(text)
+        assert isinstance(jobs, list)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(502, "KI-Suche fehlgeschlagen - nochmal probieren")
+    sauber = []
+    for j in jobs[:25]:
+        if not isinstance(j, dict) or not j.get("titel"):
+            continue
+        link = str(j.get("link", ""))
+        if not link.startswith("http"):
+            continue
+        sauber.append({
+            "titel": str(j.get("titel", ""))[:150],
+            "firma": str(j.get("firma", ""))[:100],
+            "ort": str(j.get("ort", ""))[:80],
+            "link": link,
+            "quelle": ("KI: " + str(j.get("quelle", "Web")))[:40],
+        })
+    return {"jobs": sauber}
+
+
+# ------------------------------------------------ Job-Details
+
+@app.get("/api/jobs/details")
+def job_details(link: str, user: dict = Depends(current_user)):
+    if not link.startswith("http"):
+        raise HTTPException(400, "Kein gueltiger Link")
+    try:
+        r = requests.get(link, headers=UA, timeout=12)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+        page_text = soup.get_text(" ", strip=True)[:9000]
+    except Exception:
+        raise HTTPException(502, "Inserat konnte nicht geladen werden")
+
+    prompt = f"""Das ist der Text einer Stellenanzeige. Fasse auf Deutsch kompakt zusammen:
+- Firma: wer sind die, was machen die
+- Aufgaben: was macht man in dem Job
+- Anforderungen: was muss man mitbringen
+- Gehalt: falls angegeben
+- Bewerbung: wie bewirbt man sich
+Extrahiere ausserdem die Bewerbungs-E-Mail-Adresse, falls eine im Text steht.
+Antworte NUR mit JSON: {{"zusammenfassung":"...(mit \\n zwischen Punkten)","email":"...oder leer"}}
+
+Text der Anzeige:
+{page_text}"""
+    try:
+        data = _parse_json(_claude(prompt, max_tokens=1500))
+        return {
+            "zusammenfassung": str(data.get("zusammenfassung", ""))[:4000],
+            "email": str(data.get("email", ""))[:100],
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(502, "Analyse fehlgeschlagen")
+
+
+# ------------------------------------------------ Profil / Lebenslauf
+
+def _extract_text(filename: str, data: bytes) -> str:
+    import io
+    name = (filename or "").lower()
+    if name.endswith(".pdf"):
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(data))
+        return "\n".join((p.extract_text() or "") for p in reader.pages)
+    if name.endswith(".docx"):
+        from docx import Document
+        doc = Document(io.BytesIO(data))
+        return "\n".join(p.text for p in doc.paragraphs)
+    return data.decode("utf-8", errors="replace")
+
+
+@app.get("/api/profile")
+def get_profile(user: dict = Depends(current_user)):
+    P = Query()
+    row = profiles_table.get(P.user_id == int(user["id"]))
+    if not row:
+        return {}
+    return {
+        "dateiname": row.get("dateiname", ""),
+        "datum": row.get("datum", ""),
+        "analyse": row.get("analyse", ""),
+    }
+
+
+@app.post("/api/profile/cv")
+async def upload_cv(file: UploadFile = File(...), user: dict = Depends(current_user)):
+    data = await file.read()
+    if len(data) > 5 * 1024 * 1024:
+        raise HTTPException(400, "Datei zu gross (max 5 MB)")
+    try:
+        text = _extract_text(file.filename, data)[:15000]
+    except Exception:
+        raise HTTPException(400, "Datei konnte nicht gelesen werden (PDF oder DOCX verwenden)")
+    if len(text.strip()) < 50:
+        raise HTTPException(400, "Kaum Text gefunden - ist das ein Scan? PDF mit echtem Text verwenden")
+
+    prompt = f"""Analysiere diesen Lebenslauf fuer Bewerbungen in Oesterreich (Lehre/Job).
+Antworte auf Deutsch, direkt und ehrlich, mit kurzen Absaetzen:
+1) Staerken - was kommt gut an
+2) Schwaechen/Luecken - was faellt negativ auf
+3) Konkrete Verbesserungen - was sofort aendern
+4) Passende Jobs - welche Stellen zu dem Profil passen
+
+Lebenslauf:
+{text}"""
+    analyse = _claude(prompt, max_tokens=2000)
+    P = Query()
+    profiles_table.upsert({
+        "user_id": int(user["id"]),
+        "dateiname": file.filename,
+        "cv_text": text,
+        "analyse": analyse,
+        "datum": time.strftime("%Y-%m-%d"),
+    }, P.user_id == int(user["id"]))
+    return {"analyse": analyse, "dateiname": file.filename, "datum": time.strftime("%Y-%m-%d")}
 
 
 # ---------------------------------------------------------------- Frontend
