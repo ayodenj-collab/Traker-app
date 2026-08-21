@@ -121,10 +121,31 @@
   .jobcard .ansehen { background: transparent; color: var(--accent); border: 1.5px solid var(--accent) !important; }
   .jobcard .merken { background: var(--accent); color: var(--accent-text); }
   .jobcard .merken:disabled { opacity: 0.5; }
+  .jobcard .quelle {
+    font-size: 11.5px; font-weight: 700; color: var(--accent);
+    text-transform: uppercase; letter-spacing: 0.03em;
+  }
+  .quellen-status {
+    color: var(--hint); font-size: 12px; margin-bottom: 10px; text-align: center;
+  }
 
   /* ---------- Karte (Map) ---------- */
   #mapWrap { display: none; padding: 0 16px 90px; }
   #mapWrap.show { display: block; }
+  .map-modes { display: flex; gap: 6px; margin-bottom: 10px; }
+  .map-modes button {
+    flex: 1; border: none; background: var(--bg2); color: var(--hint);
+    font: inherit; font-size: 13px; font-weight: 700;
+    padding: 8px 0; border-radius: 10px; cursor: pointer;
+  }
+  .map-modes button.active { background: var(--accent); color: var(--accent-text); }
+  #mapJobSearch { margin-bottom: 10px; }
+  .popup-merken {
+    display: inline-block; margin-top: 6px; border: none;
+    background: var(--accent, #5a9cf0); color: #fff;
+    font: inherit; font-size: 12.5px; font-weight: 700;
+    padding: 6px 12px; border-radius: 8px; cursor: pointer;
+  }
   #map { height: 62vh; border-radius: var(--radius); background: var(--bg2); }
   .map-hint { color: var(--hint); font-size: 12.5px; margin-top: 8px; text-align: center; }
   .leaflet-popup-content { font-family: inherit; font-size: 13.5px; }
@@ -220,6 +241,15 @@
 
 <!-- Ansicht: Karte -->
 <div id="mapWrap">
+  <div class="map-modes">
+    <button data-m="bewerbungen" class="active">📋 Meine Bewerbungen</button>
+    <button data-m="jobs">🔍 Jobs</button>
+  </div>
+  <div class="job-search" id="mapJobSearch" style="display:none">
+    <input id="mapJobQ" placeholder="z.B. Lehre Elektro">
+    <input id="mapJobOrt" placeholder="Wien">
+    <button id="mapJobGo">Suchen</button>
+  </div>
   <div id="map"></div>
   <div class="map-hint" id="mapHint"></div>
 </div>
@@ -408,17 +438,25 @@ async function searchJobs() {
   if (!q) { toast("Stichwort eingeben"); return; }
   const ort = $("jobOrt").value.trim();
   $("jobGo").disabled = true;
-  $("jobResults").innerHTML = `<div class="empty">Suche läuft...</div>`;
+  $("jobResults").innerHTML = `<div class="empty">Suche läuft auf karriere.at, AMS, hokify, jobs.at...</div>`;
   try {
-    const jobs = await api(`/api/jobs?q=${encodeURIComponent(q)}&ort=${encodeURIComponent(ort)}`);
+    const data = await api(`/api/jobs?q=${encodeURIComponent(q)}&ort=${encodeURIComponent(ort)}`);
+    const jobs = data.jobs || [];
+    const quellen = data.quellen || {};
+    const statusZeile = Object.entries(quellen)
+      .map(([name, s]) => s === "fehler" ? `${name} ✗` : `${name}: ${s}`)
+      .join(" · ");
+
     if (!jobs.length) {
-      $("jobResults").innerHTML = `<div class="empty">Keine Treffer für „${esc(q)}".<br>Anderes Stichwort probieren.</div>`;
+      $("jobResults").innerHTML = `<div class="empty">Keine Treffer für „${esc(q)}".<br><small>${esc(statusZeile)}</small></div>`;
       return;
     }
-    $("jobResults").innerHTML = jobs.map((j, i) => `
+    $("jobResults").innerHTML =
+      `<div class="quellen-status">${esc(statusZeile)}</div>` +
+      jobs.map((j, i) => `
       <div class="jobcard">
         <div class="titel">${esc(j.titel)}</div>
-        <div class="sub">${[j.firma, j.ort].filter(Boolean).map(esc).join(" · ")}</div>
+        <div class="sub">${[j.firma, j.ort].filter(Boolean).map(esc).join(" · ")}${(j.firma || j.ort) ? " · " : ""}<span class="quelle">${esc(j.quelle || "")}</span></div>
         <div class="row">
           ${j.link ? `<a class="ansehen" href="${esc(j.link)}" target="_blank">Ansehen</a>` : ""}
           <button class="merken" data-i="${i}">➕ Merken</button>
@@ -465,6 +503,8 @@ $("jobOrt").addEventListener("keydown", (e) => { if (e.key === "Enter") searchJo
 
 let map = null;
 let mapMarkers = [];
+let mapMode = "bewerbungen";
+let mapJobs = [];
 const STATUS_COLORS = {
   gemerkt: "#8b8f9a", beworben: "#5a9cf0", antwort: "#e0a93e",
   gespraech: "#9b6ff0", zusage: "#4caf7d", absage: "#d96a6a",
@@ -517,6 +557,7 @@ async function renderMap() {
   }
   mapMarkers.forEach((m) => map.removeLayer(m));
   mapMarkers = [];
+  if (mapMode === "jobs") { renderJobMap(); return; }
 
   const rows = applications.filter((a) => a.firma);
   if (!rows.length) { $("mapHint").textContent = "Noch keine Bewerbungen eingetragen."; return; }
@@ -557,6 +598,140 @@ async function renderMap() {
       : "";
   } else {
     $("mapHint").textContent = "Keine Position gefunden – trag bei den Bewerbungen einen Ort ein.";
+  }
+}
+
+/* ---------- Karte: Job-Modus ---------- */
+
+document.querySelectorAll(".map-modes button").forEach((b) =>
+  b.addEventListener("click", () => {
+    mapMode = b.dataset.m;
+    document.querySelectorAll(".map-modes button").forEach((x) =>
+      x.classList.toggle("active", x === b));
+    $("mapJobSearch").style.display = mapMode === "jobs" ? "flex" : "none";
+    renderMap();
+  })
+);
+
+async function searchJobsForMap() {
+  const q = $("mapJobQ").value.trim();
+  if (!q) { toast("Stichwort eingeben"); return; }
+  const ort = $("mapJobOrt").value.trim();
+  $("mapJobGo").disabled = true;
+  $("mapHint").textContent = "Suche Jobs...";
+  try {
+    const data = await api(`/api/jobs?q=${encodeURIComponent(q)}&ort=${encodeURIComponent(ort)}`);
+    mapJobs = (data.jobs || []).filter((j) => j.ort || j.firma);
+    if (!mapJobs.length) {
+      $("mapHint").textContent = "Keine Treffer mit Ortsangabe gefunden.";
+      return;
+    }
+    renderMap();
+  } catch (e) {
+    $("mapHint").textContent = e.message;
+  } finally {
+    $("mapJobGo").disabled = false;
+  }
+}
+$("mapJobGo").addEventListener("click", searchJobsForMap);
+$("mapJobQ").addEventListener("keydown", (e) => { if (e.key === "Enter") searchJobsForMap(); });
+$("mapJobOrt").addEventListener("keydown", (e) => { if (e.key === "Enter") searchJobsForMap(); });
+
+window._mapMerken = async function (idx, btnEl) {
+  const j = mapJobs[idx];
+  if (!j) return;
+  btnEl.disabled = true;
+  try {
+    await api("/api/applications", {
+      method: "POST",
+      body: JSON.stringify({
+        firma: j.firma || j.titel,
+        ort: j.ort || "",
+        art: "",
+        status: "gemerkt",
+        link: j.link || "",
+        notizen: j.titel,
+        datum: "",
+      }),
+    });
+    tg.HapticFeedback?.notificationOccurred("success");
+    btnEl.textContent = "✓ Gemerkt";
+    await load();
+  } catch (e) {
+    toast(e.message);
+    btnEl.disabled = false;
+  }
+};
+
+async function renderJobMap() {
+  if (!mapJobs.length) {
+    $("mapHint").textContent = "Oben Stichwort eingeben und suchen – Treffer erscheinen als Pins.";
+    return;
+  }
+
+  // Nach Ort gruppieren, damit jeder Ort nur 1x gesucht werden muss (schneller)
+  const ortGruppen = {};
+  for (let i = 0; i < mapJobs.length; i++) {
+    const j = mapJobs[i];
+    const ortKey = (j.ort || "").toLowerCase().trim();
+    if (!ortKey) continue;
+    (ortGruppen[ortKey] = ortGruppen[ortKey] || []).push(i);
+  }
+
+  const orte = Object.keys(ortGruppen);
+  if (!orte.length) { $("mapHint").textContent = "Treffer haben keine Ortsangabe."; return; }
+
+  let offen = orte.length;
+  $("mapHint").textContent = `Suche Positionen für ${orte.length} Orte...`;
+
+  for (const ortKey of orte) {
+    const cacheKey = ("|" + ortKey);
+    let pos = geoCache()[cacheKey];
+    if (pos === undefined) {
+      try {
+        const url = "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" +
+          encodeURIComponent(ortKey + ", Österreich");
+        const res = await fetch(url, { headers: { "Accept-Language": "de" } });
+        const arr = res.ok ? await res.json() : [];
+        pos = arr.length ? { lat: +arr[0].lat, lon: +arr[0].lon } : null;
+      } catch { pos = null; }
+      geoCacheSet(cacheKey, pos);
+      await sleep(1100);
+    }
+    offen--;
+    $("mapHint").textContent = offen > 0 ? `Suche Positionen... noch ${offen} Orte` : "";
+    if (!pos) continue;
+
+    // Mehrere Jobs am gleichen Ort: leicht versetzen, damit alle antippbar sind
+    ortGruppen[ortKey].forEach((idx, n) => {
+      const j = mapJobs[idx];
+      const jitter = 0.004;
+      const lat = pos.lat + (n % 5) * jitter - jitter * 2;
+      const lon = pos.lon + Math.floor(n / 5) * jitter;
+      const marker = L.circleMarker([lat, lon], {
+        radius: 8, color: "#2bb3a3", fillColor: "#2bb3a3", fillOpacity: 0.85, weight: 2,
+      }).addTo(map);
+      const popupEl = document.createElement("div");
+      popupEl.innerHTML =
+        `<b>${esc(j.titel)}</b><br>` +
+        [j.firma, j.ort].filter(Boolean).map(esc).join(" · ") +
+        `<br><span style="font-size:11px;font-weight:700;text-transform:uppercase">${esc(j.quelle || "")}</span><br>` +
+        (j.link ? `<a href="${esc(j.link)}" target="_blank">Ansehen</a> ` : "");
+      const btn = document.createElement("button");
+      btn.className = "popup-merken";
+      btn.textContent = "➕ Merken";
+      btn.addEventListener("click", () => window._mapMerken(idx, btn));
+      popupEl.appendChild(btn);
+      marker.bindPopup(popupEl);
+      mapMarkers.push(marker);
+    });
+  }
+
+  if (mapMarkers.length) {
+    const group = L.featureGroup(mapMarkers);
+    map.fitBounds(group.getBounds().pad(0.2), { maxZoom: 12 });
+  } else {
+    $("mapHint").textContent = "Positionen nicht gefunden.";
   }
 }
 
