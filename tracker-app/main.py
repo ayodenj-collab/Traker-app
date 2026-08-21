@@ -13,7 +13,10 @@ import hmac
 import json
 import os
 import time
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, quote_plus
+
+import requests
+from bs4 import BeautifulSoup
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
@@ -32,7 +35,7 @@ whitelist_table = db.table("whitelist")
 
 app = FastAPI(title="Bewerbungs-Tracker")
 
-STATUSES = ["beworben", "antwort", "gespraech", "zusage", "absage"]
+STATUSES = ["gemerkt", "beworben", "antwort", "gespraech", "zusage", "absage"]
 
 
 # ---------------------------------------------------------------- Whitelist
@@ -103,6 +106,7 @@ class ApplicationIn(BaseModel):
     ort: str = ""
     art: str = ""  # Lehre / Vollzeit / Teilzeit / Job
     status: str = "beworben"
+    link: str = ""
     notizen: str = ""
     datum: str = ""  # Ab wann, z.B. "2026-09-01"
 
@@ -234,6 +238,55 @@ def bot_invite(data: InviteIn, _=Depends(check_bot_secret)):
     if not whitelist_table.contains(W.user_id == data.user_id):
         whitelist_table.insert({"user_id": data.user_id})
     return {"ok": True}
+
+
+
+# ---------------------------------------------------------------- Jobsuche
+
+@app.get("/api/jobs")
+def search_jobs(q: str, ort: str = "", user: dict = Depends(current_user)):
+    """Sucht Jobs auf karriere.at und gibt Titel/Firma/Ort/Link zurueck."""
+    url = f"https://www.karriere.at/jobs/{quote_plus(q)}"
+    if ort:
+        url += f"/{quote_plus(ort)}"
+    try:
+        r = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36"},
+            timeout=12,
+        )
+        r.raise_for_status()
+    except Exception:
+        raise HTTPException(502, "karriere.at nicht erreichbar - spaeter nochmal probieren")
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    jobs = []
+    seen = set()
+
+    for item in soup.select("[class*='jobsListItem'], [class*='jobs-item'], article"):
+        a = item.select_one("a[href*='/jobs/']") or item.select_one("h2 a, h3 a")
+        if not a:
+            continue
+        titel = a.get_text(strip=True)
+        link = a.get("href", "")
+        if link.startswith("/"):
+            link = "https://www.karriere.at" + link
+        if not titel or link in seen:
+            continue
+        seen.add(link)
+
+        firma_el = item.select_one("[class*='company']")
+        ort_el = item.select_one("[class*='location']")
+        jobs.append({
+            "titel": titel,
+            "firma": firma_el.get_text(strip=True) if firma_el else "",
+            "ort": ort_el.get_text(" ", strip=True) if ort_el else "",
+            "link": link,
+        })
+        if len(jobs) >= 20:
+            break
+
+    return jobs
 
 
 # ---------------------------------------------------------------- Frontend
