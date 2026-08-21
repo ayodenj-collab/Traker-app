@@ -100,11 +100,11 @@ def current_user(x_init_data: str = Header(default="")) -> dict:
 
 class ApplicationIn(BaseModel):
     firma: str
-    position: str = ""
+    ort: str = ""
+    art: str = ""  # Lehre / Vollzeit / Teilzeit / Job
     status: str = "beworben"
-    kontakt: str = ""
     notizen: str = ""
-    datum: str = ""  # z.B. "2026-08-21"
+    datum: str = ""  # Ab wann, z.B. "2026-09-01"
 
 
 class StatusUpdate(BaseModel):
@@ -186,6 +186,41 @@ def bot_create_application(data: BotApplicationIn, _=Depends(check_bot_secret)):
         doc["datum"] = time.strftime("%Y-%m-%d")
     doc_id = apps_table.insert(doc)
     return {"id": doc_id}
+
+
+@app.get("/api/bot/applications")
+def bot_list_applications(_=Depends(check_bot_secret)):
+    """Bot holt alle Karten (fürs Mail-Matching)."""
+    out = []
+    for r in apps_table.all():
+        d = dict(r)
+        d["id"] = r.doc_id
+        out.append(d)
+    return out
+
+
+class BotStatusUpdate(BaseModel):
+    status: str = ""
+    notiz_anhang: str = ""
+
+
+@app.patch("/api/bot/applications/{app_id}")
+def bot_update_application(app_id: int, data: BotStatusUpdate, _=Depends(check_bot_secret)):
+    """Bot setzt Status und/oder hängt eine Notiz an (z.B. 'Mail erhalten')."""
+    row = apps_table.get(doc_id=app_id)
+    if not row:
+        raise HTTPException(404, "Nicht gefunden")
+    updates = {}
+    if data.status:
+        if data.status not in STATUSES:
+            raise HTTPException(400, f"Status muss einer sein von: {STATUSES}")
+        updates["status"] = data.status
+    if data.notiz_anhang:
+        alt = row.get("notizen", "")
+        updates["notizen"] = (alt + "\n" if alt else "") + data.notiz_anhang
+    if updates:
+        apps_table.update(updates, doc_ids=[app_id])
+    return {"ok": True}
 
 
 class InviteIn(BaseModel):
