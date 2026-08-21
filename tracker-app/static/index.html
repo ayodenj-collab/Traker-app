@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Bewerbungen</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
   :root {
     --bg: var(--tg-theme-bg-color, #17181c);
@@ -35,7 +37,34 @@
     justify-content: space-between;
   }
   header h1 { font-size: 19px; font-weight: 700; letter-spacing: -0.02em; }
+  header .right { display: flex; align-items: center; gap: 10px; }
   header .count { color: var(--hint); font-size: 13px; }
+  .map-toggle {
+    border: none; background: var(--bg2); color: var(--text);
+    font-size: 16px; padding: 7px 12px; border-radius: 10px; cursor: pointer;
+  }
+  .map-toggle.active { background: var(--accent); color: var(--accent-text); }
+
+  #mapWrap { display: none; padding: 0 16px 90px; }
+  #mapWrap.show { display: block; }
+  #map {
+    height: 62vh; border-radius: var(--radius);
+    background: var(--bg2);
+  }
+  .map-hint { color: var(--hint); font-size: 12.5px; margin-top: 8px; text-align: center; }
+  .leaflet-popup-content { font-family: inherit; font-size: 13.5px; }
+  .leaflet-popup-content b { font-size: 14.5px; }
+
+  /* ---------- Suche ---------- */
+  .search {
+    padding: 0 16px 10px;
+  }
+  .search input {
+    width: 100%; border: none; background: var(--bg2); color: var(--text);
+    font: inherit; padding: 10px 13px; border-radius: 11px; outline: none;
+  }
+  .search input:focus { outline: 2px solid var(--accent); }
+  .search input::placeholder { color: var(--hint); }
 
   /* ---------- Status-Tabs ---------- */
   nav {
@@ -73,7 +102,7 @@
   .card .top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
   .card .firma { font-weight: 700; font-size: 15.5px; }
   .card .datum { color: var(--hint); font-size: 12.5px; white-space: nowrap; }
-  .card .position { color: var(--hint); font-size: 13.5px; margin-top: 3px; }
+  .card .sub { color: var(--hint); font-size: 13.5px; margin-top: 3px; }
   .card .notiz {
     font-size: 13px; margin-top: 7px; color: var(--text); opacity: 0.85;
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
@@ -121,13 +150,15 @@
   .sheet textarea { min-height: 74px; resize: vertical; }
   .sheet input:focus, .sheet textarea:focus { outline: 2px solid var(--accent); }
 
-  .status-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 5px; }
-  .status-row button {
+  .chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 5px; }
+  .chip-row button {
     border: none; background: var(--bg2); color: var(--hint);
     font: inherit; font-size: 13px; font-weight: 600;
     padding: 7px 12px; border-radius: 999px; cursor: pointer;
   }
-  .status-row button.sel { background: var(--accent); color: var(--accent-text); }
+  .chip-row button.sel { background: var(--accent); color: var(--accent-text); }
+  .art-free { margin-top: 8px; display: none; }
+  .art-free.show { display: block; }
 
   .sheet .actions { display: flex; gap: 10px; margin-top: 20px; }
   .sheet .actions button {
@@ -143,6 +174,7 @@
     padding: 10px 18px; border-radius: 999px; font-size: 13.5px;
     opacity: 0; transition: opacity 0.2s; pointer-events: none;
     box-shadow: 0 4px 14px rgba(0,0,0,0.3);
+    white-space: nowrap;
   }
   .toast.show { opacity: 1; }
 
@@ -153,8 +185,20 @@
 
 <header>
   <h1>Bewerbungen</h1>
-  <span class="count" id="count"></span>
+  <div class="right">
+    <span class="count" id="count"></span>
+    <button class="map-toggle" id="mapToggle" aria-label="Karte">🗺️</button>
+  </div>
 </header>
+
+<div id="mapWrap">
+  <div id="map"></div>
+  <div class="map-hint" id="mapHint"></div>
+</div>
+
+<div class="search">
+  <input id="searchInput" type="search" placeholder="🔍 Suchen (Firma oder Ort)">
+</div>
 
 <nav id="tabs"></nav>
 <main id="list"></main>
@@ -168,16 +212,17 @@
     <label for="fFirma">Firma</label>
     <input id="fFirma" placeholder="z.B. Wiener Netze">
 
-    <label for="fPosition">Position</label>
-    <input id="fPosition" placeholder="z.B. Lehre Elektrotechnik">
+    <label for="fOrt">Ort</label>
+    <input id="fOrt" placeholder="z.B. Wien">
+
+    <label>Art</label>
+    <div class="chip-row" id="fArt"></div>
+    <input id="fArtFree" class="art-free" placeholder="z.B. Praktikum, Ferialjob...">
 
     <label>Status</label>
-    <div class="status-row" id="fStatus"></div>
+    <div class="chip-row" id="fStatus"></div>
 
-    <label for="fKontakt">Kontakt</label>
-    <input id="fKontakt" placeholder="z.B. DI Gruber, 01 234 5678">
-
-    <label for="fDatum">Beworben am</label>
+    <label for="fDatum">Ab wann</label>
     <input id="fDatum" type="date">
 
     <label for="fNotizen">Notizen</label>
@@ -206,11 +251,14 @@ const STATUSES = [
   { key: "absage",    label: "Absage" },
 ];
 const EDIT_STATUSES = STATUSES.slice(1);
+const ARTEN = ["Lehre", "Vollzeit", "Teilzeit", "Job", "Anderes"];
 
 let applications = [];
 let activeTab = "alle";
+let searchTerm = "";
 let editingId = null;   // null = neue Bewerbung
 let selStatus = "beworben";
+let selArt = "Lehre";
 
 const $ = (id) => document.getElementById(id);
 
@@ -246,16 +294,30 @@ function toast(msg) {
 function fmtDate(iso) {
   if (!iso) return "";
   const [y, m, d] = iso.split("-");
-  return `${d}.${m}.${y.slice(2)}`;
+  return `ab ${d}.${m}.${y.slice(2)}`;
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (m) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
 }
 
 /* ---------- Rendern ---------- */
 
+function matchesSearch(a) {
+  if (!searchTerm) return true;
+  const q = searchTerm.toLowerCase();
+  return (a.firma || "").toLowerCase().includes(q)
+      || (a.ort || "").toLowerCase().includes(q)
+      || (a.art || "").toLowerCase().includes(q);
+}
+
 function renderTabs() {
+  const base = applications.filter(matchesSearch);
   $("tabs").innerHTML = STATUSES.map((s) => {
     const n = s.key === "alle"
-      ? applications.length
-      : applications.filter((a) => a.status === s.key).length;
+      ? base.length
+      : base.filter((a) => a.status === s.key).length;
     return `<button data-tab="${s.key}" class="${s.key === activeTab ? "active" : ""}">
       ${s.label}<span class="n">${n}</span></button>`;
   }).join("");
@@ -265,36 +327,35 @@ function renderTabs() {
 }
 
 function renderList() {
-  const rows = activeTab === "alle"
-    ? applications
-    : applications.filter((a) => a.status === activeTab);
+  let rows = applications.filter(matchesSearch);
+  if (activeTab !== "alle") rows = rows.filter((a) => a.status === activeTab);
 
   $("count").textContent = applications.length
     ? applications.length + " gesamt" : "";
 
   if (!rows.length) {
-    $("list").innerHTML = `<div class="empty">Noch nix da.<br>Tipp auf + und trag deine erste Bewerbung ein.</div>`;
+    $("list").innerHTML = searchTerm
+      ? `<div class="empty">Nix gefunden für „${esc(searchTerm)}“</div>`
+      : `<div class="empty">Noch nix da.<br>Tipp auf + und trag deine erste Bewerbung ein.</div>`;
     return;
   }
 
-  $("list").innerHTML = rows.map((a) => `
+  $("list").innerHTML = rows.map((a) => {
+    const sub = [a.art, a.ort].filter(Boolean).join(" · ");
+    return `
     <div class="card ${a.status}" data-id="${a.id}">
       <div class="top">
         <span class="firma">${esc(a.firma)}</span>
         <span class="datum">${fmtDate(a.datum)}</span>
       </div>
-      ${a.position ? `<div class="position">${esc(a.position)}</div>` : ""}
+      ${sub ? `<div class="sub">${esc(sub)}</div>` : ""}
       ${a.notizen ? `<div class="notiz">${esc(a.notizen)}</div>` : ""}
-    </div>`).join("");
+    </div>`;
+  }).join("");
 
   $("list").querySelectorAll(".card").forEach((c) =>
     c.addEventListener("click", () => openSheet(Number(c.dataset.id)))
   );
-}
-
-function esc(s) {
-  return String(s).replace(/[&<>"']/g, (m) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
 }
 
 function render() { renderTabs(); renderList(); }
@@ -310,17 +371,42 @@ function renderStatusRow() {
   );
 }
 
+function renderArtRow() {
+  $("fArt").innerHTML = ARTEN.map((a) =>
+    `<button data-a="${a}" class="${a === selArt ? "sel" : ""}">${a}</button>`
+  ).join("");
+  $("fArt").querySelectorAll("button").forEach((b) =>
+    b.addEventListener("click", () => {
+      selArt = b.dataset.a;
+      renderArtRow();
+      $("fArtFree").classList.toggle("show", selArt === "Anderes");
+      if (selArt === "Anderes") $("fArtFree").focus();
+    })
+  );
+  $("fArtFree").classList.toggle("show", selArt === "Anderes");
+}
+
 function openSheet(id = null) {
   editingId = id;
   const a = id ? applications.find((x) => x.id === id) : null;
-  $("sheetTitle").textContent = a ? esc(a.firma) : "Neue Bewerbung";
+  $("sheetTitle").textContent = a ? a.firma : "Neue Bewerbung";
   $("fFirma").value = a ? a.firma : "";
-  $("fPosition").value = a ? a.position : "";
-  $("fKontakt").value = a ? a.kontakt : "";
-  $("fDatum").value = a ? a.datum : new Date().toISOString().slice(0, 10);
-  $("fNotizen").value = a ? a.notizen : "";
+  $("fOrt").value = a ? (a.ort || "") : "";
+  $("fDatum").value = a ? (a.datum || "") : new Date().toISOString().slice(0, 10);
+  $("fNotizen").value = a ? (a.notizen || "") : "";
   selStatus = a ? a.status : (activeTab !== "alle" ? activeTab : "beworben");
+
+  const savedArt = a ? (a.art || "") : "Lehre";
+  if (!savedArt || ARTEN.includes(savedArt)) {
+    selArt = savedArt || "Lehre";
+    $("fArtFree").value = "";
+  } else {
+    selArt = "Anderes";
+    $("fArtFree").value = savedArt;
+  }
+
   renderStatusRow();
+  renderArtRow();
   $("btnDel").style.display = a ? "block" : "none";
   $("overlay").classList.add("open");
 }
@@ -330,11 +416,12 @@ function closeSheet() { $("overlay").classList.remove("open"); }
 async function save() {
   const firma = $("fFirma").value.trim();
   if (!firma) { toast("Firma fehlt"); return; }
+  const art = selArt === "Anderes" ? $("fArtFree").value.trim() : selArt;
   const body = {
     firma,
-    position: $("fPosition").value.trim(),
+    ort: $("fOrt").value.trim(),
+    art,
     status: selStatus,
-    kontakt: $("fKontakt").value.trim(),
     datum: $("fDatum").value,
     notizen: $("fNotizen").value.trim(),
   };
@@ -368,6 +455,127 @@ async function load() {
   render();
 }
 
+/* ---------- Karte ---------- */
+
+let map = null;
+let mapMarkers = [];
+let mapOpen = false;
+const STATUS_COLORS = {
+  beworben: "#5a9cf0", antwort: "#e0a93e", gespraech: "#9b6ff0",
+  zusage: "#4caf7d", absage: "#d96a6a",
+};
+const STATUS_LABELS = {
+  beworben: "Beworben", antwort: "Antwort", gespraech: "Gespräch",
+  zusage: "Zusage", absage: "Absage",
+};
+
+function geoCache() {
+  try { return JSON.parse(localStorage.getItem("geo") || "{}"); }
+  catch { return {}; }
+}
+function geoCacheSet(key, val) {
+  const c = geoCache(); c[key] = val;
+  try { localStorage.setItem("geo", JSON.stringify(c)); } catch {}
+}
+
+async function geocode(firma, ort) {
+  const key = (firma + "|" + (ort || "")).toLowerCase();
+  const cached = geoCache()[key];
+  if (cached !== undefined) return cached;  // auch null (= nicht gefunden) cachen
+
+  const tryQuery = async (q) => {
+    const url = "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" +
+      encodeURIComponent(q);
+    const res = await fetch(url, { headers: { "Accept-Language": "de" } });
+    if (!res.ok) return null;
+    const arr = await res.json();
+    return arr.length ? { lat: +arr[0].lat, lon: +arr[0].lon, exakt: true } : null;
+  };
+
+  let result = await tryQuery(`${firma}, ${ort || "Österreich"}`);
+  if (!result && ort) {
+    // Firma nicht gefunden -> wenigstens den Ort anzeigen
+    const r = await tryQuery(`${ort}, Österreich`);
+    if (r) result = { ...r, exakt: false };
+  }
+  geoCacheSet(key, result);
+  return result;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function renderMap() {
+  if (!map) {
+    map = L.map("map").setView([47.7, 13.4], 7); // Österreich
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      attribution: "© OpenStreetMap",
+    }).addTo(map);
+  }
+  mapMarkers.forEach((m) => map.removeLayer(m));
+  mapMarkers = [];
+
+  const rows = applications.filter((a) => a.firma);
+  if (!rows.length) { $("mapHint").textContent = "Noch keine Bewerbungen eingetragen."; return; }
+
+  let gefunden = 0, offen = rows.length;
+  $("mapHint").textContent = "Suche Positionen...";
+
+  for (const a of rows) {
+    const cached = geoCache()[(a.firma + "|" + (a.ort || "")).toLowerCase()];
+    const pos = cached !== undefined ? cached : await (async () => {
+      const p = await geocode(a.firma, a.ort);
+      await sleep(1100); // Nominatim-Limit: max 1 Anfrage/Sekunde
+      return p;
+    })();
+    offen--;
+    if (!pos) continue;
+    gefunden++;
+
+    const color = STATUS_COLORS[a.status] || "#5a9cf0";
+    const marker = L.circleMarker([pos.lat, pos.lon], {
+      radius: 9, color, fillColor: color, fillOpacity: 0.85, weight: 2,
+    }).addTo(map);
+    marker.bindPopup(
+      `<b>${esc(a.firma)}</b><br>` +
+      [a.art, a.ort].filter(Boolean).map(esc).join(" · ") +
+      `<br>Status: ${STATUS_LABELS[a.status] || a.status}` +
+      (pos.exakt ? "" : "<br><i>ca. Position (nur Ort gefunden)</i>")
+    );
+    mapMarkers.push(marker);
+    $("mapHint").textContent = offen > 0 ? `Suche Positionen... noch ${offen}` : "";
+  }
+
+  if (mapMarkers.length) {
+    const group = L.featureGroup(mapMarkers);
+    map.fitBounds(group.getBounds().pad(0.25), { maxZoom: 13 });
+    $("mapHint").textContent = gefunden < rows.length
+      ? `${rows.length - gefunden} Firma(en) nicht gefunden – Ort im Eintrag ergänzen hilft`
+      : "";
+  } else {
+    $("mapHint").textContent = "Keine Position gefunden – trag bei den Bewerbungen einen Ort ein.";
+  }
+}
+
+function toggleMap() {
+  mapOpen = !mapOpen;
+  $("mapToggle").classList.toggle("active", mapOpen);
+  $("mapWrap").classList.toggle("show", mapOpen);
+  document.querySelector(".search").style.display = mapOpen ? "none" : "";
+  $("tabs").style.display = mapOpen ? "none" : "";
+  $("list").style.display = mapOpen ? "none" : "";
+  $("fab").style.display = mapOpen ? "none" : "";
+  if (mapOpen) {
+    renderMap();
+    setTimeout(() => map && map.invalidateSize(), 250);
+  }
+}
+
+$("mapToggle").addEventListener("click", toggleMap);
+
+$("searchInput").addEventListener("input", (e) => {
+  searchTerm = e.target.value.trim();
+  render();
+});
 $("fab").addEventListener("click", () => openSheet(null));
 $("btnSave").addEventListener("click", save);
 $("btnDel").addEventListener("click", del);
