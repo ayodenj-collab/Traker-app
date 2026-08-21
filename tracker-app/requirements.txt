@@ -4,3 +4,6 @@ tinydb
 pydantic
 requests
 beautifulsoup4
+python-multipart
+pypdf
+python-docx
