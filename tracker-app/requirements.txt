@@ -2,3 +2,5 @@ fastapi
 uvicorn[standard]
 tinydb
 pydantic
+requests
+beautifulsoup4
